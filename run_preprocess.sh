@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=0 python preprocess.py --base_dir .datasets/intraoral/test
