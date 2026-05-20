@@ -431,3 +431,71 @@ plt.tight_layout()
 plt.show()
 
 # %%
+import tarfile
+from pathlib import Path
+
+PERSON_DIRS = ["amy_new", "chenghao_new", "haozhou", "yinghao"]
+ROOT_DIR = Path(".datasets/intraoral")
+
+def archive_process_folders(root_dir: Path):
+    root_dir = root_dir.resolve()
+    if not root_dir.exists():
+        raise FileNotFoundError(f"{root_dir} 不存在")
+
+    for person in PERSON_DIRS:
+        person_dir = root_dir / person
+        if not person_dir.exists():
+            print(f"[跳过] 目录不存在: {person_dir}")
+            continue
+
+        process_dirs = sorted(
+            [p for p in person_dir.iterdir() if p.is_dir() and p.name.endswith("_process")]
+        )
+        if not process_dirs:
+            print(f"[跳过] 未找到 _process 目录: {person_dir}")
+            continue
+
+        archive_path = root_dir / f"{person}_processes.tar.gz"
+        print(f"打包 {person_dir} -> {archive_path}")
+
+        with tarfile.open(archive_path, "w:gz") as tar:
+            for d in process_dirs:
+                tar.add(d, arcname=d.name)
+
+        print(f"[完成] {archive_path} 大小: {archive_path.stat().st_size} bytes")
+
+if __name__ == "__main__":
+    archive_process_folders(ROOT_DIR)
+
+
+
+# %%
+from PIL import Image, ImageOps
+import os
+
+old_path = ".datasets/intraoral_anno/orth_test/orth_test/23069/R.JPG"
+new_path = "tmp.png"
+
+# 1. 补齐逻辑：通过后缀安全判断原图是否已经是 PNG 格式
+is_png = old_path.lower().endswith('.png')
+
+with Image.open(old_path) as img:
+    # 自动处理 EXIF 旋转信息（防止手机拍照导致的预览与像素坐标不符）
+    img = ImageOps.exif_transpose(img)
+    
+    w, h = img.size
+    needs_rotate = (h >= w)
+    
+    # 如果是 PNG 且不需要旋转，直接跳过
+    if is_png and not needs_rotate:
+        # 注意：continue 只能在 for 或 while 循环内部使用。
+        # 如果你这段代码本身就在循环里，请保留 continue；如果是单张图片测试，请改成 pass。
+        pass 
+    
+    # 执行旋转（逆时针旋转 90 度并扩展画布）
+    if needs_rotate:
+        img = img.rotate(90, expand=True)
+    
+    # 统一保存为无损的 PNG 格式
+    img.save(new_path, format='PNG')
+# %%
