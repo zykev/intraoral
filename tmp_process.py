@@ -187,10 +187,11 @@ model.eval()
 
 processor = Sam3Processor(model, confidence_threshold=0.5)
 # Load an image
-image = Image.open("process/s20251003/D.png")
-inference_state = processor.set_image(image)
-# Prompt the model with text
-output = processor.set_text_prompt(state=inference_state, prompt="mouth")
+image = Image.open(".datasets/intraoral/test/s1_process/process/testid1/U.png")
+with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+    inference_state = processor.set_image(image)
+    # Prompt the model with text
+    output = processor.set_text_prompt(state=inference_state, prompt="teeth")
 
 # Get the masks, bounding boxes, and scores
 masks, boxes, scores = output["masks"], output["boxes"], output["scores"]
