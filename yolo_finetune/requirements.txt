@@ -1,0 +1,5 @@
+ultralytics>=8.3.0
+torch
+Pillow
+opencv-python
+wandb
