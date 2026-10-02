@@ -4,117 +4,95 @@
 #
 # Copyright (c) 2025 Khoa D. Nguyen (Original Code)
 #
-# This script processes a dataset of intraoral images, generates tooth segmentations
-# and bounding boxes, and saves the results in a structured format.
+# This script processes a dataset of intraoral images, generates tooth
+# segmentations and bounding boxes, and saves croptooth-style crops in a
+# structured format. Its data-preparation logic mirrors tmp_process.py.
 # ============================================================================
 
-import os
+"""Prepare croptooth-style outputs plus tooth_bbox JSON for IntraoralAlignmentDataset.
+
+Expected/updated output under each <date>_process folder:
+  single_tooth/<case_id>/<view>/<fdi>.png
+  sextant/<case_id>/<view>/<sextant_id>.png
+  tooth_bbox/<case_id>/<view>.json
+  mask/<case_id>/<view>.png
+  preview/<case_id>/<view>.png
+
+Padding summary:
+- Single-tooth crops truncate the YOLO box with int(), clamp it to image bounds,
+  and crop without extra padding.
+- Sextant crops use directional padding: upper sextants expand mostly upward,
+  lower sextants mostly downward, both sides expand by 0.1 of union width, and
+  side views add an extra 0.1 toward the presumed posterior side.
+- Crop coordinates are converted with int() truncation before clamping so the
+  JSON bbox_padded matches the saved crop.
+
+The mask PNG has the same height and width as the source image. Background is
+0 and every detected tooth region is 255 (a binary uint8 mask). The tooth_bbox
+JSON is always rewritten, while crops, masks, and previews are only generated
+when missing (unless --overwrite_existing_masks is given).
+"""
+
+from __future__ import annotations
+
+import argparse
 import json
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Literal, Optional, Sequence, Tuple
+
 import cv2
 import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-from PIL import Image
-from typing import Literal, Optional, Dict, List, Tuple
-from ultralytics import YOLO
-from ultralytics.utils import LOGGER
+from tqdm import tqdm
+
 from sam import sam_load, sam_predict
 from utils import suppress_stdout
-from tqdm import tqdm
-from pathlib import Path
-import argparse
 
 
-# --- Configuration ---
-# --- Argument Parser ---
-def parse_args():
-    parser = argparse.ArgumentParser(description="SegmentAnyTooth 批量牙齿分割与处理脚本")
-    parser.add_argument(
-        "--base_dir", 
-        type=str, 
-        default=".datasets/intraoral/test", 
-        help="zeyu 根目录路径"
-    )
-    parser.add_argument(
-        "--weight_dir", 
-        type=str, 
-        default=".checkpoints/segtooth_model", 
-        help="权重文件目录"
-    )
-    parser.add_argument(
-        "--sam_batch_size", 
-        type=int, 
-        default=10, 
-        help="SAM 推理的 Batch Size"
-    )
-    parser.add_argument(
-        "--min_conf", 
-        type=float, 
-        default=0.35, 
-        help="YOLO 检测的最小置信度阈值"
-    )
-    parser.add_argument(
-        "--min_area", 
-        type=int, 
-        default=500, 
-        help="过滤检测框的最小面积(像素)"
-    )
-    return parser.parse_args()
+REPO_ROOT = Path(__file__).resolve().parent
 
-args = parse_args()
+DEFAULT_BASE_DIR = REPO_ROOT / ".datasets" / "intraoral" / "test"
+DEFAULT_WEIGHT_DIR = REPO_ROOT / ".checkpoints" / "segtooth_model"
 
-DATA_ROOT = Path(args.base_dir).resolve()
-WEIGHT_DIR = Path(args.weight_dir).resolve()
-SAM_BATCH_SIZE = args.sam_batch_size
-MIN_CONFIDENCE = args.min_conf
-MIN_AREA_PIXELS = args.min_area
-
-# View mapping: Filename prefix -> View type required by predict()
-# Assuming filenames are strictly "F.png", "U.png", "D.png", "L.png", "R.png" or similar.
-# Map: D (Down/Lower), U (Upper), F (Front), L (Left), R (Right)
-VIEW_MAPPING = {
+# View mapping: filename prefix -> view type required by predict().
+# D (Down/Lower), U (Upper), F (Front), L (Left), R (Right)
+VIEW_MAPPING: Dict[str, Literal["front", "upper", "lower", "left", "right"]] = {
     "F": "front",
     "U": "upper",
-    "D": "lower", # "D" usually stands for Down/Lower occlusal
+    "D": "lower",
     "L": "left",
-    "R": "right"
+    "R": "right",
 }
 
-# --- Target Teeth Definition ---
 # 定义每个视角下需要提取的牙齿 FDI 编号
-# 注意：Frontal 中你写了两个 42，我推测其中一个是 41。
-TARGET_TEETH_PER_VIEW = {
-    "front":  [13, 12, 11, 21, 22, 23, 43, 42, 41, 31, 32, 33],
-    "left":   [24, 25, 26, 27, 28, 34, 35, 36, 37, 38],
-    "right":  [14, 15, 16, 17, 18, 44, 45, 46, 47, 48],
-    "upper":  [18, 17, 16, 15, 14, 13, 12, 11, 21, 22, 23, 24, 25, 26, 27, 28],
-    "lower":  [38, 37, 36, 35, 34, 33, 32, 31, 41, 42, 43, 44, 45, 46, 47, 48]
+TARGET_TEETH_PER_VIEW: Dict[str, List[int]] = {
+    "front": [13, 12, 11, 21, 22, 23, 43, 42, 41, 31, 32, 33],
+    "left": [24, 25, 26, 27, 28, 34, 35, 36, 37, 38],
+    "right": [14, 15, 16, 17, 18, 44, 45, 46, 47, 48],
+    "upper": [18, 17, 16, 15, 14, 13, 12, 11, 21, 22, 23, 24, 25, 26, 27, 28],
+    "lower": [38, 37, 36, 35, 34, 33, 32, 31, 41, 42, 43, 44, 45, 46, 47, 48],
 }
 
 # Sextant 定义: 每个区域包含哪些 FDI 牙位
 # S1: 右上后牙, S2: 上前牙, S3: 左上后牙
 # S4: 左下后牙, S5: 下前牙, S6: 右下后牙
-SEXTANT_DEFINITIONS = {
-    "S1": [18, 17, 16, 15, 14, 13], # 包含13以辅助边界
+SEXTANT_DEFINITIONS: Dict[str, List[int]] = {
+    "S1": [18, 17, 16, 15, 14, 13],  # 包含13以辅助边界
     "S2": [13, 12, 11, 21, 22, 23],
-    "S3": [23, 24, 25, 26, 27, 28], # 包含23以辅助边界
-    "S4": [38, 37, 36, 35, 34, 33], # 包含33
+    "S3": [23, 24, 25, 26, 27, 28],  # 包含23以辅助边界
+    "S4": [38, 37, 36, 35, 34, 33],  # 包含33
     "S5": [33, 32, 31, 41, 42, 43],
-    "S6": [43, 44, 45, 46, 47, 48]  # 包含43
+    "S6": [43, 44, 45, 46, 47, 48],  # 包含43
 }
 
 # 视图与 Sextant 的对应关系 (即在这个视图下应该切哪些 Sextant)
-VIEW_TO_SEXTANT_MAPPING = {
+VIEW_TO_SEXTANT_MAPPING: Dict[str, List[str]] = {
     "front": ["S2", "S5"],
-    "right": ["S1", "S6"], # 此时 Right View 显示的是患者右侧
-    "left":  ["S3", "S4"],
-    "upper": [], # 通常全口咬合面不切 Sextant，或者切 S1-S3
-    "lower": []  # 通常全口咬合面不切 Sextant，或者切 S4-S6
+    "right": ["S1", "S6"],  # 此时 Right View 显示的是患者右侧
+    "left": ["S3", "S4"],
+    "upper": [],  # 通常全口咬合面不切 Sextant
+    "lower": [],  # 通常全口咬合面不切 Sextant
 }
-
-# --- Constants & Helpers from Original Code ---
-
-LOGGER.setLevel("ERROR")
 
 LEFT_CLASSES = [
     "le28", "le27", "le26", "le25", "le24", "le23", "le22", "le21",
@@ -122,64 +100,122 @@ LEFT_CLASSES = [
     "le11", "le12", "le13", "le14", "le41", "le42", "le43", "le44",
 ]
 
-def get_color_map() -> Dict[int, Tuple[int, int, int]]:
-    """生成 FDI 标签到 RGB 颜色的映射"""
-    fdi_labels = []
-    for quadrant in [1, 2, 3, 4]:
-        for tooth_num in range(1, 9):
-            label = quadrant * 10 + tooth_num
-            fdi_labels.append(label)
-    
-    num_labels = len(fdi_labels)
-    cmap = plt.get_cmap('gist_ncar', num_labels)
-    color_map = {}
-    color_map[0] = (0, 0, 0)
-    
-    for i, label in enumerate(fdi_labels):
-        rgb_float = np.array(cmap(i)[:3])
-        rgb_int = (rgb_float * 255).astype(np.uint8)
-        color_map[label] = tuple(rgb_int.tolist())
-    return color_map
+GUM_PADDING_RATIO = 0.4
+SIDE_PADDING_RATIO = 0.1
+POSTERIOR_EXTRA_SIDE_RATIO = 0.1
+UPPER_SMALL_OPPOSITE_GUM_RATIO = 0.05
+LOWER_SMALL_OPPOSITE_GUM_RATIO = 0.05
+
+
+@contextmanager
+def load_torch_checkpoint_on_available_device() -> Iterable[None]:
+    """Make third-party checkpoint loaders work on CPU-only hosts.
+
+    ``segment_anything_hq`` calls ``torch.load`` internally without a
+    ``map_location`` argument.  Its checkpoints may have been saved from a
+    CUDA host, which otherwise makes loading fail before the model can run on
+    CPU.  Keep the override tightly scoped to model construction and preserve
+    the original behavior whenever CUDA is available.
+    """
+    import torch
+
+    if torch.cuda.is_available():
+        yield
+        return
+
+    original_torch_load = torch.load
+
+    def torch_load_on_cpu(*args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("map_location", torch.device("cpu"))
+        return original_torch_load(*args, **kwargs)
+
+    torch.load = torch_load_on_cpu
+    try:
+        yield
+    finally:
+        torch.load = original_torch_load
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Rewrite tooth_bbox JSON and fill missing crops, masks, and previews."
+    )
+    parser.add_argument("--base_dir", type=Path, default=DEFAULT_BASE_DIR,
+                        help="Dataset root containing <date>_process folders.")
+    parser.add_argument("--weight_dir", type=Path, default=DEFAULT_WEIGHT_DIR,
+                        help="Directory containing SegmentAnyTooth YOLO weights.")
+    parser.add_argument("--min_conf", type=float, default=0.35,
+                        help="Minimum YOLO detection confidence.")
+    parser.add_argument("--min_area", type=int, default=500,
+                        help="Minimum YOLO box area in pixels.")
+    parser.add_argument("--sam_batch_size", type=int, default=10,
+                        help="SAM batch size used when a mask or preview must be generated.")
+    parser.add_argument("--overwrite_existing_masks", action="store_true",
+                        help="Regenerate existing mask PNGs (for example, to convert legacy label masks to binary).")
+    parser.add_argument("--json_only", action="store_true",
+                        help="Only rewrite tooth_bbox JSON; do not write crops, masks, or previews.")
+    return parser.parse_args()
+
 
 def get_model_path(
     model: Literal["upper", "lower", "left", "right", "front", "sam"],
-    weight_dir: Optional[str] = "./weight",
+    weight_dir: Path,
 ) -> str:
-    """Returns the file path to the model weights."""
+    """Return the file path to the model weights."""
     if model == "left":
-        model = "right" # Left view uses right model with flipping
-
+        model = "right"  # Left view uses right model with flipping
     if model == "sam":
         name = "vit_tiny.pt"
     else:
         name = f"yolo11_{model}.pt"
+    return str(weight_dir / f"segmentanytooth_{name}")
 
-    return os.path.join(weight_dir, f"segmentanytooth_{name}")
 
-def predict(
-    image_path: str,
+def class_name_for(names: Any, cls_id: int, use_left_classes: bool) -> str:
+    """Resolve a YOLO class id to its class/left-view name."""
+    if use_left_classes:
+        return LEFT_CLASSES[cls_id]
+    return str(names[cls_id])
+
+
+def parse_fdi(class_name: str) -> int:
+    """Parse the FDI tooth number from a YOLO class name (last two digits)."""
+    digits = "".join(ch for ch in class_name if ch.isdigit())
+    if not digits:
+        raise ValueError(f"cannot parse FDI from class name: {class_name}")
+    return int(digits[-2:])
+
+
+def predict_boxes(
+    image_path: Path,
     view: Literal["upper", "lower", "left", "right", "front"],
-    weight_dir: Optional[str] = "./weight",
-    sam_batch_size: Optional[int] = 10,
-) -> Tuple[np.ndarray, List[Dict]]:
-    """Predicts mask and boxes."""
-    weight_dir = os.path.normpath(weight_dir)
-    should_flip = view == "left"
-    
-    # Read image
-    image = cv2.imread(image_path)
+    weight_dir: Path,
+    min_conf: float,
+    min_area: int,
+) -> List[Dict[str, Any]]:
+    """Run YOLO detection and return one filtered, de-duplicated box per FDI."""
+    try:
+        from ultralytics import YOLO
+        from ultralytics.utils import LOGGER
+    except ImportError as exc:
+        raise ImportError(
+            "ultralytics is required for YOLO detection. Run this script in the "
+            "same environment used by segtooth.py."
+        ) from exc
+
+    LOGGER.setLevel("ERROR")
+
+    image = cv2.imread(str(image_path))
     if image is None:
-        raise FileNotFoundError(f"Could not read image: {image_path}")
+        raise FileNotFoundError(f"could not read image: {image_path}")
 
-    if should_flip:
-        image = cv2.flip(image, 1)
+    should_flip = view == "left"
+    infer_image = cv2.flip(image, 1) if should_flip else image
 
-    # Inference
     with suppress_stdout():
-        sam = sam_load(get_model_path("sam", weight_dir))
         yolo = YOLO(model=get_model_path(view, weight_dir))
-        r = yolo.predict(
-            image,
+        result = yolo.predict(
+            infer_image,
             save=False,
             save_txt=False,
             save_conf=False,
@@ -187,482 +223,552 @@ def predict(
             project=None,
         )[0]
 
-    if r.boxes is None or len(r.boxes) == 0:
-        return np.zeros(image.shape[:2], dtype=np.uint8)
+    if result.boxes is None or len(result.boxes) == 0:
+        return []
 
-    names = r.names if not should_flip else LEFT_CLASSES
-    boxes = r.boxes.xyxy.squeeze(0).cpu().numpy()
-    clss = r.boxes.cls.squeeze(0).cpu().numpy().astype(np.int32)
-    confs = r.boxes.conf.cpu().numpy()
+    boxes = result.boxes.xyxy.cpu().numpy()
+    clss = result.boxes.cls.cpu().numpy().astype(np.int32)
+    confs = result.boxes.conf.cpu().numpy()
 
-    # --- ### NEW: FILTERING LOGIC (过滤逻辑开始) ### ---
-    
-    # 1. Calculate Area (Width * Height)
-    # boxes format: x1, y1, x2, y2
     widths = boxes[:, 2] - boxes[:, 0]
     heights = boxes[:, 3] - boxes[:, 1]
-    areas = widths * heights
-
-    # 2. Create Boolean Mask
-    # Keep if Confidence > Threshold AND Area > Threshold
-    valid_mask = (confs >= MIN_CONFIDENCE) & (areas >= MIN_AREA_PIXELS)
-
-    # 3. Apply Filter
+    valid_mask = (confs >= min_conf) & ((widths * heights) >= min_area)
     boxes = boxes[valid_mask]
     clss = clss[valid_mask]
-    confs = confs[valid_mask] # (Optional: keep if needed for debug)
-
-    # 4. Check if anything is left after filtering
+    confs = confs[valid_mask]
     if len(boxes) == 0:
-        print(f"    (Filtered out all detections based on conf<{MIN_CONFIDENCE} or area<{MIN_AREA_PIXELS})")
-        return np.zeros(image.shape[:2], dtype=np.uint8), []
-    
-    # --- ### NEW: Step 4: Parse FDI Names early (提前解析 FDI) ### ---
-    # 我们需要先知道每个检测结果对应的真实 FDI 编号，才能进行去重
-    parsed_fdi_list = []
-    valid_indices_after_parse = []
-    
-    for idx, cls_id in enumerate(clss):
-        tooth_name_str = names[cls_id]
-        fdi = int(''.join(filter(str.isdigit, tooth_name_str)))
-        parsed_fdi_list.append(fdi)
-        valid_indices_after_parse.append(idx)
-            
-    # 只保留能解析出 FDI 的框
-    boxes = boxes[valid_indices_after_parse]
-    clss = clss[valid_indices_after_parse]
-    confs = confs[valid_indices_after_parse]
-    fdis = np.array(parsed_fdi_list) # 转换为 numpy array 方便操作
+        return []
 
-    # --- ### NEW: Step 5: Keep Max Confidence per Class (去重逻辑) ### ---
-    # 逻辑：对于每一个唯一的 fdi 编号，找到它对应的 conf 最大的那个索引
-    unique_fdis = np.unique(fdis)
-    final_indices = []
-    
-    for fdi in unique_fdis:
-        # 找到所有预测为该 FDI 的索引
-        indices_for_this_fdi = np.where(fdis == fdi)[0]
-        
-        # 找到这些索引中 conf 最大的那个在 fdis 数组中的位置
-        # np.argmax 返回的是局部位置，需要转换回 indices_for_this_fdi 中的值
-        best_local_idx = np.argmax(confs[indices_for_this_fdi])
-        best_global_idx = indices_for_this_fdi[best_local_idx]
-        
-        final_indices.append(best_global_idx)
-    
-    # 应用去重筛选
+    fdis = np.array(
+        [parse_fdi(class_name_for(result.names, int(cls_id), should_flip)) for cls_id in clss],
+        dtype=np.int32,
+    )
+
+    # Keep the highest-confidence box for each FDI.
+    final_indices: List[int] = []
+    for fdi in np.unique(fdis):
+        indices = np.where(fdis == fdi)[0]
+        best_local_idx = np.argmax(confs[indices])
+        final_indices.append(int(indices[best_local_idx]))
+
     boxes = boxes[final_indices]
     clss = clss[final_indices]
     confs = confs[final_indices]
+    fdis = fdis[final_indices]
 
-    sort_ids = np.argsort(clss)
-    clss = clss[sort_ids]
-    boxes = boxes[sort_ids]
-    confs = confs[sort_ids]
+    order = np.argsort(clss)
+    boxes = boxes[order]
+    clss = clss[order]
+    confs = confs[order]
+    fdis = fdis[order]
 
     if should_flip:
-        image_width = image.shape[1]
-        image = cv2.flip(image, 1)
+        image_width = infer_image.shape[1]
         flipped_boxes = boxes.copy()
         flipped_boxes[:, [0, 2]] = image_width - flipped_boxes[:, [2, 0]]
         boxes = flipped_boxes
 
-    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    records: List[Dict[str, Any]] = []
+    for fdi, box, conf in zip(fdis, boxes, confs):
+        records.append({
+            "fdi_tooth_name": int(fdi),
+            "box": [float(v) for v in box.tolist()],
+            "confidence": float(conf),
+        })
+    return records
 
+
+def predict_mask_with_sam(
+    image: np.ndarray,
+    boxes_data: List[Dict[str, Any]],
+    weight_dir: Path,
+    sam_batch_size: int,
+) -> np.ndarray:
+    """Return a full-resolution label mask where each tooth pixel is its FDI."""
+    if not boxes_data:
+        return np.zeros(image.shape[:2], dtype=np.uint8)
+
+    try:
+        import torch
+    except ImportError as exc:
+        raise ImportError(
+            "torch is required to generate masks or previews. Run this script in the "
+            "same environment used by segtooth.py, or use --json_only if you only "
+            "need tooth_bbox JSON."
+        ) from exc
+
+    with suppress_stdout(), load_torch_checkpoint_on_available_device():
+        sam = sam_load(get_model_path("sam", weight_dir))
+    # ``CUDA_VISIBLE_DEVICES`` renumbers the selected card to ``cuda:0``;
+    # selecting plain ``cuda`` therefore uses the card assigned to this
+    # process rather than a physical GPU index hard-coded in the script.
+    sam.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    sam.eval()
+
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    boxes_xyxy = np.array([item["box"] for item in boxes_data], dtype=np.float32)
     sam_masks = sam_predict(
         sam=sam,
-        boxes_xyxy=boxes,
+        boxes_xyxy=boxes_xyxy,
         image=image_rgb,
         batch_size=sam_batch_size,
     )
 
     predict_mask = np.zeros(image.shape[:2], dtype=np.uint8)
-    boxes_data_list = []
-    
-    for i, (cls_id, current_mask) in enumerate(zip(clss, sam_masks)):
-        fdi_tooth_name = int(names[cls_id][-2:])
-        predict_mask[current_mask == 1] = fdi_tooth_name
-        box = boxes[i]
-        boxes_data_list.append({
-            "fdi_tooth_name": fdi_tooth_name,
-            "box": box.tolist(),
-            "confidence": float(confs[i]) # 可选：把置信度也存进JSON
-        })
+    for item, current_mask in zip(boxes_data, sam_masks):
+        fdi = int(item["fdi_tooth_name"])
+        predict_mask[current_mask == 1] = fdi
 
-    return predict_mask, boxes_data_list
+    return predict_mask
 
-def process_and_save(
-    mask: np.ndarray, 
-    boxes_data: List[Dict], 
-    image_path: str,
-    json_output_dir: str,
-    preview_output_dir: str,
-    file_stem: str # e.g. "F"
-):
-    """
-    Saves JSON to json_output_dir and PNG to preview_output_dir.
-    """
-    STANDARD_FDI_COLOR_MAP = get_color_map()
-    original_image = Image.open(image_path)
-    
-    # 1. Save JSON
-    json_output = {}
-    for item in boxes_data:
-        class_name = str(item["fdi_tooth_name"]) # Use string for JSON keys
-        box = item["box"]
-        conf = item['confidence']
-        if class_name not in json_output:
-            json_output[class_name] = []
-        json_output[class_name].append({
-            "box": box,
-            "confidence": conf
-        })
-    
-    os.makedirs(json_output_dir, exist_ok=True)
-    json_filename = f"{file_stem}.json"
-    json_path = os.path.join(json_output_dir, json_filename)
-    
-    with open(json_path, 'w') as f:
-        json.dump(json_output, f, indent=4)
-    # print(f"  -> JSON saved: {json_path}")
 
-    # 2. Save Visualization PNG
+def get_color_map() -> Dict[int, Tuple[int, int, int]]:
+    """生成 FDI 标签到 RGB 颜色的映射"""
+    import matplotlib.pyplot as plt
+
+    fdi_labels = []
+    for quadrant in [1, 2, 3, 4]:
+        for tooth_num in range(1, 9):
+            fdi_labels.append(quadrant * 10 + tooth_num)
+
+    cmap = plt.get_cmap("gist_ncar", len(fdi_labels))
+    color_map: Dict[int, Tuple[int, int, int]] = {0: (0, 0, 0)}
+    for i, label in enumerate(fdi_labels):
+        rgb_float = np.array(cmap(i)[:3])
+        rgb_int = (rgb_float * 255).astype(np.uint8)
+        color_map[label] = tuple(rgb_int.tolist())
+    return color_map
+
+
+def save_preview_original_style(
+    image: np.ndarray,
+    mask: np.ndarray,
+    boxes_data: List[Dict[str, Any]],
+    preview_path: Path,
+) -> None:
+    """Save the original segtooth-style visualization PNG (mask + boxes)."""
+    if preview_path.exists():
+        return
+
+    import matplotlib.patches as patches
+    import matplotlib.pyplot as plt
+
+    preview_path.parent.mkdir(parents=True, exist_ok=True)
+    color_map = get_color_map()
     h, w = mask.shape
     colored_mask = np.zeros((h, w, 3), dtype=np.uint8)
-    for label, color in STANDARD_FDI_COLOR_MAP.items():
+    for label, color in color_map.items():
         colored_mask[mask == label] = color
 
-    # Setup Plot
-    # Use output dpi=100, calculate figsize to match original resolution approximately
-    fig, ax = plt.subplots(1, 1, figsize=(w/100, h/100), dpi=100)
-    
-    # Visualization Config
-    LABEL_FONTSIZE = 20
-    TEXT_COLOR = 'cyan' 
-    BOX_COLOR = 'yellow' 
-    MASK_ALPHA = 0.5
-    
-    ax.imshow(original_image)
-    ax.imshow(colored_mask, alpha=MASK_ALPHA)
+    fig, ax = plt.subplots(1, 1, figsize=(w / 100, h / 100), dpi=100)
+    label_fontsize = 20
+    text_color = "cyan"
+    box_color = "yellow"
+    mask_alpha = 0.5
+
+    ax.imshow(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+    ax.imshow(colored_mask, alpha=mask_alpha)
 
     for item in boxes_data:
         class_name = str(item["fdi_tooth_name"])
         box = item.get("box")
-        if box is None or len(box) != 4: continue
-
+        if box is None or len(box) != 4:
+            continue
         xmin, ymin, xmax, ymax = box
-        
-        # Draw Box
         rect = patches.Rectangle(
-            (xmin, ymin), xmax - xmin, ymax - ymin,
-            linewidth=2, edgecolor=BOX_COLOR, facecolor='none'
+            (xmin, ymin),
+            xmax - xmin,
+            ymax - ymin,
+            linewidth=2,
+            edgecolor=box_color,
+            facecolor="none",
         )
         ax.add_patch(rect)
-        
-        # Draw Label
         ax.text(
-            xmin, ymin - 10, class_name,
-            color=TEXT_COLOR, fontsize=LABEL_FONTSIZE, fontweight='bold',
-            bbox=dict(facecolor='red', alpha=0.5, edgecolor='none', boxstyle='round,pad=0.1')
+            xmin,
+            ymin - 10,
+            class_name,
+            color=text_color,
+            fontsize=label_fontsize,
+            fontweight="bold",
+            bbox=dict(facecolor="red", alpha=0.5, edgecolor="none", boxstyle="round,pad=0.1"),
         )
-        
-    ax.axis('off')
-    
-    os.makedirs(preview_output_dir, exist_ok=True)
-    preview_filename = f"{file_stem}.png"
-    preview_path = os.path.join(preview_output_dir, preview_filename)
-    
-    fig.savefig(preview_path, bbox_inches='tight', pad_inches=0)
-    plt.close(fig)
-    # print(f"  -> Preview saved: {preview_path}")
 
-def save_single_tooth_images(
-    image: np.ndarray,      # 原始图像 (OpenCV BGR 格式)
-    mask: np.ndarray,       # 全图分割掩码 (每个像素值为 FDI 编号)
-    boxes_data: List[Dict], # 包含 box 和 FDI 的列表
-    output_root: str,       # single_tooth/idxxx/
-    view_stem: str,         # 当前视角代码，如 "F", "L"
-    view_type: str,         # 当前视角类型，如 "front", "left"
-):
-    """
-    根据 Bounding Box 裁剪牙齿，并将掩码外的区域置黑，保存为单颗牙齿图片。
-    """
-    # 1. 获取当前视角允许的目标牙齿列表
-    target_fdis = TARGET_TEETH_PER_VIEW.get(view_type, [])
-    
-    # 2. 创建该视角对应的子文件夹 (例如 single_tooth/id001/F/)
-    dir_name = os.path.dirname(output_root)
-    id_name = os.path.basename(output_root)
-    # view_mask_output_dir = os.path.join(dir_name + "_mask", id_name, view_stem)
-    view_nomask_output_dir = os.path.join(dir_name, id_name, view_stem)
-    # os.makedirs(view_mask_output_dir, exist_ok=True)
-    os.makedirs(view_nomask_output_dir, exist_ok=True)
-    
+    ax.axis("off")
+    fig.savefig(preview_path, bbox_inches="tight", pad_inches=0)
+    plt.close(fig)
+
+
+def clamp_int_box(values: Sequence[float], img_w: int, img_h: int) -> Tuple[List[int], bool]:
+    """int()-truncate a box, clamp it to the image, and report if it was clamped."""
+    x1, y1, x2, y2 = (int(v) for v in values)
+    clamped = x1 < 0 or y1 < 0 or x2 > img_w or y2 > img_h
+    x1 = max(0, x1)
+    y1 = max(0, y1)
+    x2 = min(img_w, x2)
+    y2 = min(img_h, y2)
+    return [x1, y1, x2, y2], clamped
+
+
+def pad_sextant_box(
+    union_box: Sequence[float],
+    sextant_id: str,
+    view_type: str,
+    img_w: int,
+    img_h: int,
+) -> Tuple[List[int], bool, Dict[str, float]]:
+    """Apply the directional sextant padding and return the padded box."""
+    union_x1, union_y1, union_x2, union_y2 = union_box
+    box_w = union_x2 - union_x1
+    box_h = union_y2 - union_y1
+
+    is_upper = sextant_id in {"S1", "S2", "S3"}
+    if is_upper:
+        pad_top = box_h * GUM_PADDING_RATIO
+        pad_bottom = box_h * UPPER_SMALL_OPPOSITE_GUM_RATIO
+    else:
+        pad_top = box_h * LOWER_SMALL_OPPOSITE_GUM_RATIO
+        pad_bottom = box_h * GUM_PADDING_RATIO
+
+    pad_left = box_w * SIDE_PADDING_RATIO
+    pad_right = box_w * SIDE_PADDING_RATIO
+    extra_side_ratio = 0.0
+    if view_type == "right":
+        pad_left += box_w * POSTERIOR_EXTRA_SIDE_RATIO
+        extra_side_ratio = POSTERIOR_EXTRA_SIDE_RATIO
+    elif view_type == "left":
+        pad_right += box_w * POSTERIOR_EXTRA_SIDE_RATIO
+        extra_side_ratio = POSTERIOR_EXTRA_SIDE_RATIO
+
+    padded, clamped = clamp_int_box(
+        (union_x1 - pad_left, union_y1 - pad_top, union_x2 + pad_right, union_y2 + pad_bottom),
+        img_w,
+        img_h,
+    )
+    pad_params = {
+        "gum_ratio": GUM_PADDING_RATIO,
+        "side_ratio": SIDE_PADDING_RATIO,
+        "extra_side_ratio": extra_side_ratio,
+        "small_opposite_gum_ratio": (
+            UPPER_SMALL_OPPOSITE_GUM_RATIO if is_upper else LOWER_SMALL_OPPOSITE_GUM_RATIO
+        ),
+    }
+    return padded, clamped, pad_params
+
+
+def valid_box(box: Sequence[int]) -> bool:
+    return box[2] > box[0] and box[3] > box[1]
+
+
+def rel_path(path: Path, base: Path) -> str:
+    return path.relative_to(base).as_posix()
+
+
+def save_crop(image: np.ndarray, bbox: Sequence[int], save_path: Path) -> None:
+    if save_path.exists():
+        return
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    x1, y1, x2, y2 = bbox
+    crop = image[y1:y2, x1:x2].copy()
+    cv2.imwrite(str(save_path), crop)
+
+
+def save_binary_tooth_mask(mask: np.ndarray, save_path: Path, overwrite: bool = False) -> None:
+    """Save an original-resolution binary tooth mask."""
+    if save_path.exists() and not overwrite:
+        return
+    if mask.ndim != 2:
+        raise ValueError(f"tooth mask must be HxW, got shape {mask.shape}")
+    binary_mask = np.where(mask != 0, 255, 0).astype(np.uint8)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(save_path), binary_mask):
+        raise IOError(f"failed to write tooth mask: {save_path}")
+
+
+def load_annotation(json_path: Path) -> Dict[str, Any]:
+    with open(json_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def boxes_from_annotation(
+    annotation: Dict[str, Any],
+    json_path: Path,
+) -> List[Dict[str, Any]]:
+    """Recover YOLO/SAM-style box records from an existing annotation."""
+    boxes_data: List[Dict[str, Any]] = []
+    for index, tooth in enumerate(annotation.get("teeth", [])):
+        fdi = tooth.get("fdi", tooth.get("fdi_tooth_name"))
+        box = tooth.get("bbox_yolo", tooth.get("box"))
+        if fdi is None or box is None or len(box) != 4:
+            raise ValueError(
+                f"invalid tooth record {index} in {json_path}: expected fdi and a 4-value bbox_yolo"
+            )
+        boxes_data.append({
+            "fdi_tooth_name": int(fdi),
+            "box": [float(value) for value in box],
+            "confidence": float(tooth.get("confidence", 1.0)),
+        })
+    return boxes_data
+
+
+def build_tooth_records(
+    image: np.ndarray,
+    boxes_data: List[Dict[str, Any]],
+    date_path: Path,
+    case_id: str,
+    view_stem: str,
+    view_type: str,
+    write_outputs: bool,
+) -> List[Dict[str, Any]]:
     img_h, img_w = image.shape[:2]
+    target_fdis = set(TARGET_TEETH_PER_VIEW.get(view_type, []))
+    records: List[Dict[str, Any]] = []
 
     for item in boxes_data:
-        fdi = item["fdi_tooth_name"]
-        box = item["box"]
-        
-        # 3. 过滤：如果这颗牙不在当前视角的提取列表中，跳过
+        fdi = int(item["fdi_tooth_name"])
         if fdi not in target_fdis:
             continue
-            
-        # 4. 获取坐标并进行边界检查 (Clamping)
-        # YOLO 输出可能是 float，转换为 int
-        x1, y1, x2, y2 = map(int, box)
-        x1 = max(0, x1)
-        y1 = max(0, y1)
-        x2 = min(img_w, x2)
-        y2 = min(img_h, y2)
-        
-        # 检查无效框
-        if x2 <= x1 or y2 <= y1:
+
+        crop_box, clamped = clamp_int_box(item["box"], img_w, img_h)
+        if not valid_box(crop_box):
             continue
 
-        # 5. 裁剪图像和掩码
-        # crop_img: (H, W, 3)
-        crop_img = image[y1:y2, x1:x2].copy()
-        # # crop_mask: (H, W) - 注意这里裁剪的是全图掩码
-        # crop_mask = mask[y1:y2, x1:x2]
-        
-        # # 6. 应用遮罩 (Apply Mask)
-        # # 我们只保留当前 FDI 编号的像素。
-        # # 注意：crop_mask 中可能包含相邻牙齿的部分（例如切 11 时切到了 21），
-        # # 我们必须把那些也变成黑色，只保留 11。
-        
-        # # 创建二值掩码：只有当前牙齿区域为 255 (白色)，其余为 0 (黑色)
-        # binary_mask = np.zeros_like(crop_mask, dtype=np.uint8)
-        # binary_mask[crop_mask == fdi] = 255
-        
-        # # 7. 保存图片
-        # # --- Version A: Masked (应用遮罩，背景置黑) ---
-        # masked_tooth = cv2.bitwise_and(crop_img, crop_img, mask=binary_mask)
-        # cv2.imwrite(os.path.join(view_mask_output_dir, f"{fdi}.png"), masked_tooth)
-        
-        # --- Version B: Unmasked (不应用遮罩，只进行裁剪) ---
-        # 直接保存裁剪后的原始图像
-        cv2.imwrite(os.path.join(view_nomask_output_dir, f"{fdi}.png"), crop_img)
+        crop_path = date_path / "single_tooth" / case_id / view_stem / f"{fdi}.png"
+        if write_outputs:
+            save_crop(image, crop_box, crop_path)
+        records.append({
+            "fdi": fdi,
+            "bbox_yolo": item["box"],
+            "confidence": item["confidence"],
+            "pad_ratio": 0.0,
+            "bbox_padded": crop_box,
+            "clamped": clamped,
+            "crop_path": rel_path(crop_path, date_path),
+        })
 
-def save_sextant_crops(
-    image: np.ndarray,      # 原始图像
-    boxes_data: List[Dict], # 检测到的牙齿数据
-    output_root: str,       # sextant/idxxx/
-    view_stem: str,         # "F", "L", "R"
-    view_type: str          # "front", "left", "right"
-):
-    """
-    聚合多颗牙齿的 Bounding Box，生成 Sextant 区域裁剪图。
-    """
+    return records
+
+
+def build_sextant_records(
+    image: np.ndarray,
+    boxes_data: List[Dict[str, Any]],
+    date_path: Path,
+    case_id: str,
+    view_stem: str,
+    view_type: str,
+    write_outputs: bool,
+) -> List[Dict[str, Any]]:
+    img_h, img_w = image.shape[:2]
     target_sextants = VIEW_TO_SEXTANT_MAPPING.get(view_type, [])
     if not target_sextants:
-        return
+        return []
 
-    # 创建输出目录: sextant/id001/F/
-    view_output_dir = os.path.join(output_root, view_stem)
-    os.makedirs(view_output_dir, exist_ok=True)
-    
-    img_h, img_w = image.shape[:2]
-
-    # 将检测数据转换为便于查找的字典: fdi -> box
-    detection_map = {item["fdi_tooth_name"]: item["box"] for item in boxes_data}
+    detection_map = {int(item["fdi_tooth_name"]): item for item in boxes_data}
+    records: List[Dict[str, Any]] = []
 
     for sextant_id in target_sextants:
-        target_fdis = SEXTANT_DEFINITIONS[sextant_id]
-        
-        # 1. 收集属于当前 Sextant 的所有牙齿的 Box
-        relevant_boxes = []
-        for fdi in target_fdis:
-            if fdi in detection_map:
-                relevant_boxes.append(detection_map[fdi])
-        
-        # 如果当前 Sextant 一颗牙都没检测到，跳过
-        if not relevant_boxes:
+        member_fdis = [fdi for fdi in SEXTANT_DEFINITIONS[sextant_id] if fdi in detection_map]
+        if not member_fdis:
             continue
-            
-        # 2. 计算 Union Box (合并大框)
-        relevant_boxes = np.array(relevant_boxes) # Shape: [N, 4]
-        # x1_min, y1_min, x2_max, y2_max
-        union_x1 = np.min(relevant_boxes[:, 0])
-        union_y1 = np.min(relevant_boxes[:, 1])
-        union_x2 = np.max(relevant_boxes[:, 2])
-        union_y2 = np.max(relevant_boxes[:, 3])
-        
-        # 基础宽高
-        box_w = union_x2 - union_x1
-        box_h = union_y2 - union_y1
-        
-        # 3. 应用定向 Padding (核心逻辑)
-        # 初始化 padding 值
-        pad_top = 0
-        pad_bottom = 0
-        pad_left = 0
-        pad_right = 0
-        
-        # 定义扩充比例
-        GUM_PADDING_RATIO = 0.4  # 垂直方向扩充 40% 看牙龈
-        SIDE_PADDING_RATIO = 0.1 # 水平方向适当扩充 10%
 
-        # 根据 Sextant ID 判断是上颌还是下颌
-        is_upper = sextant_id in ["S1", "S2", "S3"]
-        
-        if is_upper:
-            # 上颌牙：重点向上扩充 (y_min 减小)
-            pad_top = box_h * GUM_PADDING_RATIO
-            pad_bottom = box_h * 0.05 # 下方稍微留一点点
-        else:
-            # 下颌牙：重点向下扩充 (y_max 增加)
-            pad_top = box_h * 0.05
-            pad_bottom = box_h * GUM_PADDING_RATIO
-            
-        # 水平扩充 (左右各扩一点，防止切断边缘牙齿)
-        pad_left = box_w * SIDE_PADDING_RATIO
-        pad_right = box_w * SIDE_PADDING_RATIO
-        
-        # 特殊处理：Right View (S1, S6) 和 Left View (S3, S4) 的智齿区域
-        # 假设图片左侧是口腔后方 (对于右视图通常如此，视拍摄手法而定)
-        # 这里使用通用的左右扩充通常足够。如果需要特定方向（如向后方扩充），可以根据 view_type 调整
-        if view_type == "right": 
-             # 右视图，通常图片左边是后牙区，右边是前牙
-             pad_left += box_w * 0.1 # 向后方多扩一点
-        elif view_type == "left":
-             # 左视图，通常图片右边是后牙区
-             pad_right += box_w * 0.1
+        relevant_boxes = np.array(
+            [detection_map[fdi]["box"] for fdi in member_fdis], dtype=np.float32
+        )
+        union_box = [
+            float(np.min(relevant_boxes[:, 0])),
+            float(np.min(relevant_boxes[:, 1])),
+            float(np.max(relevant_boxes[:, 2])),
+            float(np.max(relevant_boxes[:, 3])),
+        ]
 
-        # 4. 应用坐标变换
-        final_x1 = int(union_x1 - pad_left)
-        final_y1 = int(union_y1 - pad_top)
-        final_x2 = int(union_x2 + pad_right)
-        final_y2 = int(union_y2 + pad_bottom)
-        
-        # 5. 边界检查 (Clamping)
-        final_x1 = max(0, final_x1)
-        final_y1 = max(0, final_y1)
-        final_x2 = min(img_w, final_x2)
-        final_y2 = min(img_h, final_y2)
-        
-        # 确保有效
-        if final_x2 <= final_x1 or final_y2 <= final_y1:
+        padded, clamped, pad_params = pad_sextant_box(union_box, sextant_id, view_type, img_w, img_h)
+        if not valid_box(padded):
             continue
-            
-        # 6. 裁剪并保存
-        crop_img = image[final_y1:final_y2, final_x1:final_x2]
-        
-        filename = f"{sextant_id}.png"
-        save_path = os.path.join(view_output_dir, filename)
-        cv2.imwrite(save_path, crop_img)
+
+        crop_path = date_path / "sextant" / case_id / view_stem / f"{sextant_id}.png"
+        if write_outputs:
+            save_crop(image, padded, crop_path)
+        records.append({
+            "id": sextant_id,
+            "member_fdi_detected": member_fdis,
+            "bbox_union_raw": union_box,
+            "bbox_padded": padded,
+            "pad_params": pad_params,
+            "clamped": clamped,
+            "crop_path": rel_path(crop_path, date_path),
+        })
+
+    return records
 
 
+def write_annotation(
+    date_path: Path,
+    case_id: str,
+    view_stem: str,
+    image_path: Path,
+    image: np.ndarray,
+    tooth_records: List[Dict[str, Any]],
+    sextant_records: List[Dict[str, Any]],
+) -> Path:
+    json_path = date_path / "tooth_bbox" / case_id / f"{view_stem}.json"
+
+    img_h, img_w = image.shape[:2]
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    annotation = {
+        "case_id": case_id,
+        "view": view_stem,
+        "image_path": rel_path(image_path, date_path),
+        "orig_size": [img_w, img_h],
+        "teeth": tooth_records,
+        "sextants": sextant_records,
+    }
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(annotation, f, ensure_ascii=False, indent=2)
+    return json_path
 
 
-def main():
-    if not DATA_ROOT.exists():
-        print(f"Error: Base directory '{DATA_ROOT}' does not exist.")
+def iter_image_files(case_dir: Path) -> Iterable[Tuple[str, str, Path]]:
+    valid_extensions = [".png", ".jpg", ".jpeg", ".PNG", ".JPG", ".JPEG"]
+    for stem, view_type in VIEW_MAPPING.items():
+        for ext in valid_extensions:
+            image_path = case_dir / f"{stem}{ext}"
+            if image_path.exists():
+                yield stem, view_type, image_path
+                break
+
+
+def process_view(
+    image_path: Path,
+    date_path: Path,
+    case_id: str,
+    view_stem: str,
+    view_type: str,
+    args: argparse.Namespace,
+) -> None:
+    json_path = date_path / "tooth_bbox" / case_id / f"{view_stem}.json"
+    mask_path = date_path / "mask" / case_id / f"{view_stem}.png"
+    preview_path = date_path / "preview" / case_id / f"{view_stem}.png"
+
+    # Reuse the recorded boxes from an existing annotation so YOLO does not have
+    # to run again. The JSON itself is always rewritten below.
+    boxes_data: Optional[List[Dict[str, Any]]] = None
+    if json_path.exists():
+        annotation = load_annotation(json_path)
+        if "teeth" in annotation:
+            boxes_data = boxes_from_annotation(annotation, json_path)
+        # A file without a "teeth" list uses an incompatible/legacy schema, so
+        # fall through and recompute the boxes with YOLO rather than writing an
+        # empty annotation over it.
+
+    image = cv2.imread(str(image_path))
+    if image is None:
+        raise FileNotFoundError(f"could not read image: {image_path}")
+
+    if boxes_data is None:
+        boxes_data = predict_boxes(
+            image_path=image_path,
+            view=view_type,
+            weight_dir=args.weight_dir.resolve(),
+            min_conf=args.min_conf,
+            min_area=args.min_area,
+        )
+
+    tooth_records = build_tooth_records(
+        image=image,
+        boxes_data=boxes_data,
+        date_path=date_path,
+        case_id=case_id,
+        view_stem=view_stem,
+        view_type=view_type,
+        write_outputs=not args.json_only,
+    )
+    sextant_records = build_sextant_records(
+        image=image,
+        boxes_data=boxes_data,
+        date_path=date_path,
+        case_id=case_id,
+        view_stem=view_stem,
+        view_type=view_type,
+        write_outputs=not args.json_only,
+    )
+    write_annotation(
+        date_path=date_path,
+        case_id=case_id,
+        view_stem=view_stem,
+        image_path=image_path,
+        image=image,
+        tooth_records=tooth_records,
+        sextant_records=sextant_records,
+    )
+
+    if args.json_only:
         return
 
-    # 定义错误日志路径
-    error_log_path = DATA_ROOT / "process_errors.txt"
+    needs_mask = args.overwrite_existing_masks or not mask_path.exists()
+    needs_preview = not preview_path.exists()
+    if needs_mask or needs_preview:
+        mask = predict_mask_with_sam(
+            image=image,
+            boxes_data=boxes_data,
+            weight_dir=args.weight_dir.resolve(),
+            sam_batch_size=args.sam_batch_size,
+        )
+        if needs_mask:
+            save_binary_tooth_mask(mask, mask_path, overwrite=args.overwrite_existing_masks)
+        if needs_preview:
+            save_preview_original_style(
+                image=image,
+                mask=mask,
+                boxes_data=boxes_data,
+                preview_path=preview_path,
+            )
 
-    # 1. 查找所有以 _process 结尾的日期文件夹
-    date_folders = [d for d in DATA_ROOT.iterdir() if d.is_dir() and d.name.endswith("_process")]
-    date_folders.sort()
 
+def main() -> None:
+    args = parse_args()
+    args.base_dir = Path(args.base_dir).expanduser().resolve()
+    args.weight_dir = Path(args.weight_dir).expanduser().resolve()
+
+    if not args.base_dir.exists():
+        raise FileNotFoundError(f"base_dir does not exist: {args.base_dir}")
+    if not args.weight_dir.exists():
+        raise FileNotFoundError(f"weight_dir does not exist: {args.weight_dir}")
+
+    error_log_path = args.base_dir / "process_errors.txt"
+    date_folders = sorted(
+        d for d in args.base_dir.iterdir() if d.is_dir() and d.name.endswith("_process")
+    )
     if not date_folders:
-        print("No '_process' folders found in zeyu directory.")
+        print(f"No '*_process' folders found under {args.base_dir}")
         return
 
-    # --- 总进度条 ---
-    pbar_dates = tqdm(date_folders, desc="Overall Dates", unit="date")
-    
-    for date_path in pbar_dates:
-        pbar_dates.set_description(f"Date: {date_path.name}")
-        
+    for date_path in tqdm(date_folders, desc="Dates", unit="date"):
         input_root = date_path / "process"
         if not input_root.exists():
             continue
 
-        json_output_root = date_path / "tooth_bbox"
-        preview_output_root = date_path / "preview"
-        single_tooth_output_root = date_path / "single_tooth"
-        sextant_output_root = date_path / "sextant"
+        case_dirs = sorted(d for d in input_root.iterdir() if d.is_dir())
+        for case_dir in tqdm(case_dirs, desc=f"  {date_path.name}", unit="case", leave=False):
+            for view_stem, view_type, image_path in iter_image_files(case_dir):
+                try:
+                    process_view(
+                        image_path=image_path,
+                        date_path=date_path,
+                        case_id=case_dir.name,
+                        view_stem=view_stem,
+                        view_type=view_type,
+                        args=args,
+                    )
+                except Exception as exc:  # keep batch processing resilient
+                    tqdm.write(f"Skipping {image_path} due to error: {exc}")
+                    with open(error_log_path, "a", encoding="utf-8") as f:
+                        f.write(f"ERROR | Path: {image_path} | Reason: {exc}\n")
 
-        id_dirs = [d for d in input_root.iterdir() if d.is_dir()]
-        id_dirs.sort()
-
-        # --- 子进度条 ---
-        pbar_ids = tqdm(id_dirs, desc=f"  Processing {date_path.name}", leave=False, unit="id")
-        
-        for id_folder_path in pbar_ids:
-            id_folder = id_folder_path.name
-            
-            id_json_path = json_output_root / id_folder
-            id_preview_path = preview_output_root / id_folder
-            id_single_tooth_path = single_tooth_output_root / id_folder
-            id_sextant_path = sextant_output_root / id_folder
-
-            valid_extensions = ['.png', '.jpg', '.jpeg', '.PNG']
-            
-            for stem, view_name in VIEW_MAPPING.items():
-                found_file = False
-                for ext in valid_extensions:
-                    filename = f"{stem}{ext}"
-                    file_path = id_folder_path / filename
-                    
-                    if file_path.exists():
-                        found_file = True
-                        try:
-                            # 预测
-                            mask, boxes_data = predict(
-                                image_path=str(file_path),
-                                view=view_name,
-                                weight_dir=WEIGHT_DIR,
-                                sam_batch_size=SAM_BATCH_SIZE
-                            )
-                            
-                            # 保存 JSON 和 预览图
-                            process_and_save(
-                                mask=mask,
-                                boxes_data=boxes_data,
-                                image_path=str(file_path),
-                                json_output_dir=str(id_json_path),
-                                preview_output_dir=str(id_preview_path),
-                                file_stem=stem
-                            )
-
-                            raw_image = cv2.imread(str(file_path)) 
-                            
-                            # 保存单颗牙齿
-                            save_single_tooth_images(
-                                image=raw_image,
-                                mask=mask,
-                                boxes_data=boxes_data,
-                                output_root=str(id_single_tooth_path),
-                                view_stem=stem,
-                                view_type=view_name
-                            )
-
-                            # 保存 Sextant 区域
-                            save_sextant_crops(
-                                image=raw_image,
-                                boxes_data=boxes_data,
-                                output_root=str(id_sextant_path),
-                                view_stem=stem,
-                                view_type=view_name
-                            )
-                        except Exception as e:
-                            # --- 异常记录逻辑 ---
-                            error_msg = f"ERROR | Path: {file_path} | Reason: {str(e)}\n"
-                            tqdm.write(f"Skipping {file_path.name} due to error.")
-                            
-                            # 以追加模式写入 txt
-                            with open(error_log_path, "a", encoding="utf-8") as f:
-                                f.write(error_msg)
-                        break
-    
     if error_log_path.exists():
-        print(f"\nProcessing finished. Some errors occurred, check: {error_log_path}")
+        print(f"Processing finished. Some errors occurred, check: {error_log_path}")
     else:
-        print("\n--- All tasks completed successfully without errors! ---")
+        print("All tasks completed successfully without errors.")
+
 
 if __name__ == "__main__":
     main()

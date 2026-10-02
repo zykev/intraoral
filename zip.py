@@ -1,54 +1,34 @@
 import os
-import shutil
-from pathlib import Path
+import zipfile
 
-def zip_process_folders(base_path="."):
-    """
-    将指定人名文件夹下以 'process' 结尾的子文件夹分别进行压缩。
-    
-    :param base_path: 包含 zeyu, amy 等文件夹的根目录，默认为当前目录
-    """
-    # 指定的目标人名文件夹
-    target_users = ["zeyu", "amy", "chenghao", "garris"]
-    base_dir = Path(base_path)
+# 1. 定义 chenghao 文件夹的路径（如果脚本就在 chenghao 目录下运行，可以直接用 '.'）
+target_dir = "/disk1/work/zychen/Datasets/intraoral/chenghao"
 
-    for user in target_users:
-        user_dir = base_dir / user
-        
-        # 检查人名文件夹是否存在
-        if not user_dir.exists() or not user_dir.is_dir():
-            print(f"提示: 找不到文件夹 {user_dir}，已跳过。")
-            continue
-            
-        print(f"正在处理 {user} 的文件夹...")
-        
-        # 计数器，记录处理了多少个 process 文件夹
-        zip_count = 0
-        
-        # 遍历人名文件夹下的所有子项目
-        for item in user_dir.iterdir():
-            # 判断是否为文件夹，且名字以 'process' 结尾（忽略大小写，如需严格匹配可去掉 .lower()）
-            if item.is_dir() and item.name.lower().endswith("process"):
-                # 定义压缩包的输出路径（和原文件夹在同一目录下，名字相同）
-                # shutil.make_archive 会自动加上 .zip 后缀
-                output_zip_path = user_dir / item.name
-                
-                print(f"  正在压缩: {item.name} -> {item.name}.zip")
-                
-                # 执行压缩，format='zip' 表示压缩为 zip 格式
-                shutil.make_archive(
-                    base_name=str(output_zip_path),
-                    format='zip',
-                    root_dir=str(item)
-                )
-                zip_count += 1
-                
-        if zip_count == 0:
-            print(f"  {user} 文件夹下没有找到以 'process' 结尾的子文件夹。")
-        else:
-            print(f"  {user} 处理完毕，共压缩了 {zip_count} 个文件夹。\n")
+# 检查路径是否存在
+if not os.path.exists(target_dir):
+    print(f"错误：找不到路径 {target_dir}，请检查路径是否正确。")
+    exit()
 
-if __name__ == "__main__":
-    # 如果你的脚本和 zeyu, amy 等文件夹在同一个目录下，直接运行即可
-    # 如果在其他地方，传入对应的路径，例如：zip_process_folders("/path/to/folders")
-    zip_process_folders('/home/zychen/Documents/intraoral_code/intraoral/.datasets/intraoral')
+# 2. 遍历文件夹中的所有文件
+for file_name in os.listdir(target_dir):
+    # 只处理以 .zip 结尾的文件
+    if file_name.lower().endswith('.zip'):
+        zip_path = os.path.join(target_dir, file_name)
+        
+        # 获取不带后缀的文件夹名称（例如 "20251013"）
+        folder_name = file_name[:-4] 
+        output_dir = os.path.join(target_dir, folder_name)
+        
+        # 3. 创建同名文件夹（如果不存在的话）
+        os.makedirs(output_dir, exist_ok=True)
+        
+        print(f"正在解压: {file_name} -> {folder_name}/")
+        
+        # 4. 执行解压操作
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(output_dir)
+        except Exception as e:
+            print(f"解压 {file_name} 失败: {e}")
+
+print("所有 ZIP 文件解压完成！")
