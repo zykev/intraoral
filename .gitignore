@@ -2,3 +2,11 @@ __pycache__
 scripts
 
 .datasets
+
+# Ultralytics downloads these into the current directory. yolo26n.pt is fetched
+# by check_amp() as the FP32-vs-AMP reference model, not by our training code,
+# and every GPU run re-downloads it if it is missing.
+yolo*.pt
+
+
+exp

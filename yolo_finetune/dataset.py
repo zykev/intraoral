@@ -29,6 +29,26 @@ MODEL_VIEWS = ("front", "upper", "lower", "right")
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
 FDI_PATTERN = re.compile(r"(?<!\d)([1-4][1-8])(?!\d)")
 
+DEFAULT_ANNOTATION_ROOT = "intraoral_adjust/tooth_bbox_adj"
+
+# Fine-tuning keeps every annotated tooth the checkpoint's class map can express,
+# including the "cross-view" FDI numbers that ``segtooth.py::TARGET_TEETH_PER_VIEW``
+# discards after inference.  Training on the whole visible arch can only help the
+# detector learn to see teeth; the per-view whitelist still applies downstream.
+# These sets list the extra FDI numbers that are deliberately kept, and exist so
+# the label audit can report how much supervision the widened range adds.
+# Keep in sync with ``segtooth.py``.
+CROSS_VIEW_FDI = {
+    "front": {14, 15, 16, 17, 18, 24, 25, 26, 27, 28,
+              34, 35, 36, 37, 38, 44, 45, 46, 47, 48},
+    # upper/lower already train on their complete class range (16 teeth each).
+    "upper": set(),
+    "lower": set(),
+    "right": {11, 12, 13, 21, 22, 23, 24, 31, 32, 33, 34, 41, 42, 43},
+    "left": {11, 12, 13, 14, 21, 22, 23, 31, 32, 33, 41, 42, 43, 44},
+}
+UNKNOWN_FDI_POLICIES = ("skip", "raise")
+
 # This ordering must remain identical to segtooth_new.py. During left-view
 # inference, class ID i is interpreted as LEFT_CLASSES[i].
 LEFT_CLASSES = [
@@ -170,19 +190,144 @@ def find_process_folders(data_root: str | Path) -> list[Path]:
     return sorted(candidates)
 
 
+def _source_views(model_view: str) -> list[str]:
+    """Return the image views that feed one detector.
+
+    ``left`` has no checkpoint of its own: left images are flipped in memory and
+    trained as additional ``right`` samples, exactly like ``segtooth.py`` infers
+    them.
+    """
+
+    if model_view not in MODEL_VIEWS:
+        raise ValueError(f"model_view must be one of {MODEL_VIEWS}, got {model_view}")
+    return ["right", "left"] if model_view == "right" else [model_view]
+
+
+def index_process_images(data_root: str | Path) -> dict[tuple[str, str], list[Path]]:
+    """Index every source image as ``(subject_id, view_stem) -> [paths]``.
+
+    Subject IDs are not guaranteed to be unique across people, so the value is a
+    list and the caller narrows it down with the annotation's own size metadata.
+    """
+
+    images: dict[tuple[str, str], list[Path]] = {}
+    for process_folder in find_process_folders(data_root):
+        image_root = process_folder / "process"
+        for subject_dir in image_root.iterdir():
+            if not subject_dir.is_dir():
+                continue
+            for path in subject_dir.iterdir():
+                if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
+                    key = (subject_dir.name, path.stem.upper())
+                    images.setdefault(key, []).append(path)
+    return images
+
+
+def resolve_source_image(
+    candidates: Sequence[Path],
+    expected_size: Sequence[int] | None,
+    subject_id: str,
+    stem: str,
+) -> Path:
+    """Pick the single source image whose pixel size matches ``orig_size``."""
+
+    if not candidates:
+        raise FileNotFoundError(
+            f"No source image found for subject {subject_id!r} view {stem!r} under "
+            "the given data root."
+        )
+    wanted = [int(value) for value in expected_size] if expected_size else None
+    matching: list[Path] = []
+    for candidate in sorted(candidates):
+        try:
+            with Image.open(candidate) as image:
+                size = list(image.size)
+        except OSError:
+            continue
+        if wanted is None or size == wanted:
+            matching.append(candidate)
+    if len(matching) == 1:
+        return matching[0]
+    if not matching:
+        raise ValueError(
+            f"No candidate image for subject {subject_id!r} view {stem!r} matches "
+            f"the annotation size {wanted}: {[str(path) for path in candidates]}"
+        )
+    raise ValueError(
+        f"Subject {subject_id!r} view {stem!r} is ambiguous across "
+        f"{[str(path) for path in matching]}; pass a narrower --data-root."
+    )
+
+
+def discover_samples_from_annotation_root(
+    annotation_root: str | Path,
+    data_root: str | Path,
+    model_view: str,
+) -> list[ToothSample]:
+    """Pair a flat ``<annotation_root>/<subject>/<view>.json`` tree with images.
+
+    ``tooth_bbox_adj`` is a parallel, batch-independent tree, so the source image
+    is not stored next to the annotation. It is resolved through the image index
+    built from ``data_root`` and confirmed against the annotation's own
+    ``orig_size`` metadata, which also catches a wrong subject/image pairing.
+    """
+
+    root = Path(annotation_root).expanduser().resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"Annotation root does not exist: {root}")
+
+    image_index = index_process_images(data_root)
+    samples: list[ToothSample] = []
+    for subject_dir in sorted(path for path in root.iterdir() if path.is_dir()):
+        for source_view in _source_views(model_view):
+            stem = VIEW_TO_STEM[source_view]
+            annotation_path = subject_dir / f"{stem}.json"
+            if not annotation_path.is_file():
+                continue
+            with annotation_path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            subject_id = str(payload.get("case_id") or subject_dir.name)
+            if subject_id != subject_dir.name:
+                raise ValueError(
+                    f"{annotation_path} declares case_id {subject_id!r} but lives in "
+                    f"{subject_dir.name!r}; rename the annotation or the folder."
+                )
+            samples.append(
+                ToothSample(
+                    image_path=resolve_source_image(
+                        image_index.get((subject_id, stem), []),
+                        payload.get("orig_size"),
+                        subject_id,
+                        stem,
+                    ),
+                    annotation_path=annotation_path,
+                    subject_id=subject_id,
+                    source_view=source_view,
+                )
+            )
+    return samples
+
+
 def discover_samples(
     data_root: str | Path,
     model_view: str,
     annotation_dir: str = "tooth_bbox_revise",
+    annotation_root: str | Path | None = None,
 ) -> list[ToothSample]:
-    """Collect one detector's images; right always includes flipped L views."""
+    """Collect one detector's images; right always includes flipped L views.
 
-    if model_view not in MODEL_VIEWS:
-        raise ValueError(f"model_view must be one of {MODEL_VIEWS}, got {model_view}")
+    ``annotation_root`` selects the flat, batch-independent ground-truth tree
+    (``intraoral_adjust/tooth_bbox_adj``); leave it ``None`` to use the legacy
+    per-batch ``<*_process>/<annotation_dir>`` layout instead.
+    """
 
-    source_views = [model_view]
-    if model_view == "right":
-        source_views.append("left")
+    source_views = _source_views(model_view)
+    if annotation_root is not None:
+        return discover_samples_from_annotation_root(
+            annotation_root=annotation_root,
+            data_root=data_root,
+            model_view=model_view,
+        )
 
     samples: list[ToothSample] = []
     for process_folder in find_process_folders(data_root):
@@ -213,8 +358,31 @@ def discover_samples(
     return samples
 
 
+def _validate_box(box: object, path: Path, where: str) -> list[float]:
+    """Return ``box`` as four floats, or raise with a precise message."""
+
+    if not (
+        isinstance(box, list)
+        and len(box) == 4
+        and all(isinstance(value, (int, float)) for value in box)
+    ):
+        raise ValueError(f"{where} box must contain four numeric values in {path}")
+    return [float(value) for value in box]
+
+
 def load_annotation(annotation_path: str | Path) -> list[tuple[int, list[float]]]:
-    """Read ``{FDI: [{"box": [x1, y1, x2, y2]}]}`` annotations."""
+    """Read either supported annotation layout as ``[(fdi, xyxy), ...]``.
+
+    * revision layout -- ``{FDI: [{"box": [x1, y1, x2, y2]}, ...]}``, used by the
+      per-batch ``tooth_bbox_revise`` directories;
+    * ground-truth layout -- ``{"teeth": [{"fdi": 16, "bbox_yolo": [...]}]}``,
+      used by ``intraoral_adjust/tooth_bbox_adj`` (and by ``unfiltered_bbox`` /
+      ``tooth_bbox`` exports).
+
+    In the ground-truth layout ``bbox_yolo`` holds the final corrected box;
+    ``bbox_padded`` is the same box rounded to integers for cropping, so it is
+    only a fallback.
+    """
 
     path = Path(annotation_path)
     with path.open("r", encoding="utf-8") as handle:
@@ -223,52 +391,98 @@ def load_annotation(annotation_path: str | Path) -> list[tuple[int, list[float]]
     if not isinstance(payload, dict):
         raise ValueError(f"Annotation root must be a JSON object: {path}")
 
-    annotations: list[tuple[int, list[float]]] = []
+    if "teeth" in payload:
+        teeth = payload["teeth"]
+        if not isinstance(teeth, list):
+            raise ValueError(f"'teeth' must be a list in {path}")
+        annotations: list[tuple[int, list[float]]] = []
+        for index, tooth in enumerate(teeth):
+            if not isinstance(tooth, dict):
+                raise ValueError(f"teeth[{index}] must be an object in {path}")
+            fdi = tooth.get("fdi")
+            if not isinstance(fdi, int):
+                raise ValueError(f"teeth[{index}] has no integer 'fdi' in {path}")
+            box = next(
+                (tooth[key] for key in ("bbox_yolo", "bbox_padded") if key in tooth),
+                None,
+            )
+            annotations.append(
+                (fdi, _validate_box(box, path, f"teeth[{index}]"))
+            )
+        return annotations
+
+    annotations = []
     for fdi_key, entries in payload.items():
         fdi = extract_fdi(fdi_key)
         if fdi is None:
             raise ValueError(f"Invalid FDI key {fdi_key!r} in {path}")
         if not isinstance(entries, list):
             raise ValueError(f"FDI {fdi} must contain a list of boxes in {path}")
-        for entry in entries:
+        for index, entry in enumerate(entries):
             if not isinstance(entry, dict) or "box" not in entry:
                 raise ValueError(
                     f"FDI {fdi} entries must be objects containing 'box' in {path}"
                 )
-            box = entry["box"]
-            if not (
-                isinstance(box, list)
-                and len(box) == 4
-                and all(isinstance(value, (int, float)) for value in box)
-            ):
-                raise ValueError(
-                    f"FDI {fdi} box must contain four numeric values in {path}"
-                )
-            annotations.append((fdi, [float(value) for value in box]))
+            annotations.append(
+                (fdi, _validate_box(entry["box"], path, f"FDI {fdi} entries[{index}]"))
+            )
     return annotations
+
+
+@dataclass
+class PreparedTargets:
+    """Detector-ready XYXY boxes plus an audit of the labels that produced them."""
+
+    boxes: np.ndarray
+    class_ids: np.ndarray
+    cross_view: Counter[int]
+    unknown_fdi: Counter[int]
 
 
 def prepare_targets(
     sample: ToothSample,
     fdi_to_class: Mapping[int, int],
     image_size: tuple[int, int],
-) -> tuple[np.ndarray, np.ndarray]:
+    unknown: str = "skip",
+) -> PreparedTargets:
     """Map JSON FDI labels to class IDs and return clipped XYXY boxes.
+
+    Every tooth the class map can express is kept -- deliberately including the
+    cross-view FDI numbers (``CROSS_VIEW_FDI``) that
+    ``segtooth.py::TARGET_TEETH_PER_VIEW`` filters out at inference time -- so the
+    detector learns to see the whole visible arch instead of only the teeth that
+    the downstream per-view whitelist happens to want.
+
+    ``unknown`` decides what happens to an FDI the checkpoint has no class for:
+    ``"skip"`` (default) drops that box and reports it in the audit, ``"raise"``
+    fails instead.  The class map, not a hard-coded range, is the authority, so
+    widening a detector is a matter of its checkpoint's class list.
 
     L-view labels use the exact ``LEFT_CLASSES[class_id]`` order from
     ``segtooth_new.py``. Their boxes are flipped with the source image.
     """
 
+    if unknown not in UNKNOWN_FDI_POLICIES:
+        raise ValueError(
+            f"unknown must be one of {UNKNOWN_FDI_POLICIES}, got {unknown!r}"
+        )
+
     width, height = image_size
+    widened = CROSS_VIEW_FDI.get(sample.source_view, set())
     boxes: list[list[float]] = []
     class_ids: list[int] = []
+    cross_view: Counter[int] = Counter()
+    unknown_fdi: Counter[int] = Counter()
     for fdi, raw_box in load_annotation(sample.annotation_path):
         if fdi not in fdi_to_class:
-            raise ValueError(
-                f"FDI {fdi} in {sample.annotation_path} is not defined by the "
-                f"{sample.source_view} class mapping."
-            )
-        if len(raw_box) != 4 or not all(math.isfinite(value) for value in raw_box):
+            if unknown == "raise":
+                raise ValueError(
+                    f"FDI {fdi} in {sample.annotation_path} is not defined by the "
+                    f"{sample.source_view} class mapping."
+                )
+            unknown_fdi[fdi] += 1
+            continue
+        if not all(math.isfinite(value) for value in raw_box):
             raise ValueError(f"Invalid box for FDI {fdi} in {sample.annotation_path}")
 
         x1, y1, x2, y2 = raw_box
@@ -283,21 +497,28 @@ def prepare_targets(
 
         boxes.append([x1, y1, x2, y2])
         class_ids.append(fdi_to_class[fdi])
+        if fdi in widened:
+            cross_view[fdi] += 1
 
-    return (
-        np.asarray(boxes, dtype=np.float32).reshape(-1, 4),
-        np.asarray(class_ids, dtype=np.float32).reshape(-1, 1),
+    return PreparedTargets(
+        boxes=np.asarray(boxes, dtype=np.float32).reshape(-1, 4),
+        class_ids=np.asarray(class_ids, dtype=np.float32).reshape(-1, 1),
+        cross_view=cross_view,
+        unknown_fdi=unknown_fdi,
     )
 
 
 def summarize_samples(
     samples: Sequence[ToothSample],
     class_names: Mapping[int, str] | Sequence[str],
+    unknown: str = "skip",
 ) -> dict[str, object]:
     """Validate all labels and summarize one split without writing files."""
 
     box_count = 0
     source_views: Counter[str] = Counter()
+    cross_view: Counter[int] = Counter()
+    unknown_fdi: Counter[int] = Counter()
     class_mappings = {"default": build_fdi_to_class(class_names)}
     if any(sample.source_view == "left" for sample in samples):
         class_mappings["left"] = validate_left_class_mapping(class_names)
@@ -305,13 +526,18 @@ def summarize_samples(
         with Image.open(sample.image_path) as image:
             image_size = image.size
         mapping = class_mappings.get(sample.source_view, class_mappings["default"])
-        boxes, _ = prepare_targets(sample, mapping, image_size)
-        box_count += len(boxes)
+        targets = prepare_targets(sample, mapping, image_size, unknown=unknown)
+        box_count += len(targets.boxes)
         source_views[sample.source_view] += 1
+        cross_view.update(targets.cross_view)
+        unknown_fdi.update(targets.unknown_fdi)
     return {
         "images": len(samples),
         "boxes": box_count,
         "source_views": dict(sorted(source_views.items())),
+        "cross_view_boxes": sum(cross_view.values()),
+        "dropped_unknown_boxes": sum(unknown_fdi.values()),
+        "dropped_unknown_fdi": dict(sorted(unknown_fdi.items())),
     }
 
 
@@ -320,6 +546,10 @@ class InMemoryToothYOLODataset(YOLODataset):
 
     No YOLO label files, image links, image copies, or flipped images are
     written. Left images and their boxes are flipped in memory on every load.
+
+    Labels keep every FDI the checkpoint class map can express, including the
+    cross-view teeth that ``segtooth.py::TARGET_TEETH_PER_VIEW`` would drop
+    after inference; see ``prepare_targets``.
     """
 
     def __init__(
@@ -327,8 +557,14 @@ class InMemoryToothYOLODataset(YOLODataset):
         *args,
         samples: Sequence[ToothSample],
         class_names: Mapping[int, str] | Sequence[str],
+        unknown_fdi: str = "skip",
         **kwargs,
     ) -> None:
+        if unknown_fdi not in UNKNOWN_FDI_POLICIES:
+            raise ValueError(
+                f"unknown_fdi must be one of {UNKNOWN_FDI_POLICIES}, got {unknown_fdi!r}"
+            )
+        self.unknown_fdi = unknown_fdi
         self.samples = list(samples)
         self.class_names = normalize_class_names(class_names)
         self.class_mappings = {
@@ -341,6 +577,11 @@ class InMemoryToothYOLODataset(YOLODataset):
         self._sample_by_path = {
             str(sample.image_path.resolve()): sample for sample in self.samples
         }
+        # train.py's build_dataset() forwards cache=False, which would collide
+        # with the explicit cache=False below ("got multiple values for keyword
+        # argument 'cache'"). Caching stays off either way, so accept and drop
+        # whatever the caller asked for.
+        kwargs.pop("cache", None)
         super().__init__(*args, cache=False, **kwargs)
 
     def get_img_files(self, img_path: str | list[str]) -> list[str]:
@@ -351,7 +592,7 @@ class InMemoryToothYOLODataset(YOLODataset):
         return image_files
 
     def get_labels(self) -> list[dict[str, object]]:
-        """Convert revised JSON annotations to Ultralytics label dictionaries."""
+        """Convert the JSON annotations to Ultralytics label dictionaries."""
 
         labels: list[dict[str, object]] = []
         valid_files = list(self.im_files)
@@ -363,11 +604,13 @@ class InMemoryToothYOLODataset(YOLODataset):
                 sample.source_view,
                 self.class_mappings["default"],
             )
-            boxes, class_ids = prepare_targets(
+            targets = prepare_targets(
                 sample,
                 mapping,
                 (width, height),
+                unknown=self.unknown_fdi,
             )
+            boxes, class_ids = targets.boxes, targets.class_ids
 
             xywh = boxes.copy()
             if len(xywh):

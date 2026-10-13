@@ -19,7 +19,7 @@ CREDENTIALS_DIR = "/home/zychen/Documents/intraoral_code"
 GDRIVE_PARENT_FOLDER_ID = "1J8Ko4wIwJBVzJNFKQuNvSf0JT_kfKFXk"
 
 # 4. 指定需要处理的人名列表
-TARGET_NAMES = ["amy", "chenghao", "garris", "haozhou", "henry", "yinghao", "zeyu"]
+TARGET_NAMES = ["amy", "chenghao", "garris", "haozhou", "henry", "yinghao", "zeyu", "zeyu_new"]
 
 # 5. 云端新建的目标文件夹名称（本次上传归档目录）
 UPLOAD_FOLDER_NAME = "process0929"
@@ -131,6 +131,11 @@ def find_or_create_folder(service, folder_name, parent_id):
 
 def upload_file_to_gdrive(service, local_file_path, filename, parent_folder_id):
     """上传单个文件到 Google Drive 的指定文件夹下"""
+    # 文件在上传前消失（被移动/删除/失效软链接）→ 跳过，不算失败
+    if not os.path.isfile(local_file_path):
+        print(f"  跳过（本地文件不存在）: {filename}")
+        return
+
     mime_type, _ = mimetypes.guess_type(local_file_path)
     if not mime_type:
         mime_type = 'application/octet-stream'
@@ -167,15 +172,32 @@ def file_exists_in_folder(service, filename, parent_folder_id):
 
 def upload_folder_to_gdrive(service, local_folder_path, parent_folder_id, skip_existing=True):
     """递归上传本地文件夹（含子文件夹）到 Google Drive 指定父文件夹下"""
+    # 本地文件夹不存在（可能已被移动 / 删除 / 是失效的软链接）→ 直接跳过，不中断整个上传
+    if not os.path.isdir(local_folder_path):
+        print(f"  跳过（本地不存在或不是文件夹）: {local_folder_path}")
+        return
+
     folder_name = os.path.basename(os.path.normpath(local_folder_path))
+
+    # 先读取目录内容；万一读取过程中目录被删/权限问题，也优雅跳过而不是崩溃
+    try:
+        entries = sorted(os.listdir(local_folder_path))
+    except OSError as e:
+        print(f"  跳过（无法读取本地目录）: {local_folder_path} ({e})")
+        return
 
     cloud_folder_id = find_or_create_folder(service, folder_name, parent_folder_id)
     if not cloud_folder_id:
         print(f"  错误: 无法创建云端文件夹 【{folder_name}】，跳过该文件夹。")
         return
 
-    for entry in sorted(os.listdir(local_folder_path)):
+    for entry in entries:
         full_local_path = os.path.join(local_folder_path, entry)
+
+        # 条目可能在遍历期间消失（被移动/删除），先确认存在再处理
+        if not os.path.exists(full_local_path):
+            print(f"  跳过（本地已不存在）: {entry}")
+            continue
 
         if os.path.isdir(full_local_path):
             upload_folder_to_gdrive(service, full_local_path, cloud_folder_id, skip_existing)

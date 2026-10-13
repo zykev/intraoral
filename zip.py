@@ -1,8 +1,9 @@
 import os
 import zipfile
 
-# 1. 定义 chenghao 文件夹的路径（如果脚本就在 chenghao 目录下运行，可以直接用 '.'）
-target_dir = "/disk1/work/zychen/Datasets/intraoral/chenghao"
+# 1. 定义 chenghao 文件夹的路径（走仓库内的 .datasets/ 软链，无需 cd /disk1）
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+target_dir = os.path.join(REPO_ROOT, ".datasets", "intraoral", "chenghao")
 
 # 检查路径是否存在
 if not os.path.exists(target_dir):
